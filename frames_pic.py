@@ -1,13 +1,14 @@
 import os
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 
 # 🔧 Configuration
-INPUT_FOLDER = "splits"
+INPUT_FOLDER = "scans"
 OUTPUT_FOLDER = "borders"
 
 OUTPUT_LONG_SIDE = 3000   # max long edge for export
 MIN_BORDER = 50            # minimum white border (all around)
-BLACK_LINE = 9            # black stroke around image
+CORNER_RADIUS_PCT = 0.02   # rounded corner radius as % of smaller image side
+UPSCALE_SMALLER = True    # if True, small images will scale up to meet the target box
 
 def choose_canvas_size(w, h):
     """
@@ -20,6 +21,7 @@ def choose_canvas_size(w, h):
         return (OUTPUT_LONG_SIDE, int(OUTPUT_LONG_SIDE * 4 / 5))  # 5:4 landscape
 def process_image(img_path, output_path):
     img = Image.open(img_path).convert("RGB")
+    img = ImageOps.exif_transpose(img)
     w, h = img.size
 
     # Step 1: choose fixed canvas size
@@ -29,7 +31,16 @@ def process_image(img_path, output_path):
     max_w = canvas_w - 2 * MIN_BORDER
     max_h = canvas_h - 2 * MIN_BORDER
 
-    img.thumbnail((max_w, max_h), Image.LANCZOS)
+    # Compute scale to fit within the box
+    w0, h0 = img.size
+    scale = min(max_w / w0, max_h / h0)
+
+    # Resize: always downscale; upscale only if UPSCALE_SMALLER is True
+    if scale < 1 or UPSCALE_SMALLER:
+        new_w = max(1, int(round(w0 * scale)))
+        new_h = max(1, int(round(h0 * scale)))
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+
     iw, ih = img.size
 
     # Step 3: create white canvas
@@ -39,14 +50,14 @@ def process_image(img_path, output_path):
     x = (canvas_w - iw) // 2
     y = (canvas_h - ih) // 2
 
-    # Step 5: draw black stroke around photo
-    draw = ImageDraw.Draw(canvas)
-    draw.rectangle([x - BLACK_LINE, y - BLACK_LINE,
-                    x + iw + BLACK_LINE - 1, y + ih + BLACK_LINE - 1],
-                   outline="black", width=BLACK_LINE)
+    # Step 5: create a rounded-corner mask and paste the image with it
+    radius = max(1, int(min(iw, ih) * CORNER_RADIUS_PCT))
+    mask = Image.new("L", (iw, ih), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.rounded_rectangle([0, 0, iw, ih], radius=radius, fill=255)
 
-    # Step 6: paste photo
-    canvas.paste(img, (x, y))
+    # Step 6: paste image with rounded corners onto the white canvas
+    canvas.paste(img, (x, y), mask)
 
     # Save
     canvas.save(output_path, quality=95, subsampling=0)
