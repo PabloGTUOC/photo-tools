@@ -8,6 +8,9 @@ from tkinter import ttk, filedialog, messagebox
 import tiff_to_jpeg as tj
 import split_half_frames as sf
 import frames_pic as fp
+import fix_dates as fd
+import rename_files as rn
+
 
 # -------- Utilidades comunes --------
 _last_dir = os.path.join(os.path.expanduser("~"), "Desktop")  # start in Desktop by default
@@ -278,6 +281,165 @@ class FramesPicFrame(ttk.Frame):
         self.log.insert("end", f"\nHecho. OK: {ok}, Fallos: {fail}\n")
         self.btn.state(["!disabled"])
 
+# ====== Pantalla 4: Cambiar fechas ======
+class FixDatesFrame(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+        self.inp = tk.StringVar()
+        self.recursive = tk.BooleanVar(value=True)
+        self.dry_run = tk.BooleanVar(value=True)   # por defecto en prueba
+        self.pb = None; self.log = None; self.btn = None
+        self._build()
+
+    def _build(self):
+        pad={'padx':10,'pady':6}
+        ttk.Label(self, text="Fix Dates — EXIF DateTimeOriginal → FileCreate/Modify", font=("TkDefaultFont", 12, "bold")).grid(column=0,row=0,columnspan=3,sticky="w",**pad)
+
+        ttk.Label(self,text="Carpeta entrada:").grid(column=0,row=1,sticky="w",**pad)
+        ttk.Entry(self,textvariable=self.inp,width=54).grid(column=1,row=1,sticky="we",**pad)
+        ttk.Button(self,text="Elegir…",command=lambda: choose_dir(self.inp,"Carpeta con fotos")).grid(column=2,row=1,**pad)
+
+        ttk.Separator(self).grid(column=0,row=2,columnspan=3,sticky="we",**pad)
+
+        ttk.Checkbutton(self,text="Recursivo (subcarpetas)",variable=self.recursive).grid(column=0,row=3,sticky="w",**pad)
+        ttk.Checkbutton(self,text="Dry-run (no cambia nada)",variable=self.dry_run).grid(column=1,row=3,sticky="w",**pad)
+
+        self.pb = ttk.Progressbar(self, mode="determinate")
+        self.pb.grid(column=0,row=4,columnspan=3,sticky="we",**pad)
+
+        self.log = tk.Text(self, height=12)
+        self.log.grid(column=0,row=5,columnspan=3,sticky="nsew",**pad)
+        self.grid_rowconfigure(5, weight=1); self.grid_columnconfigure(1, weight=1)
+
+        self.btn = ttk.Button(self,text="Ejecutar",command=self.start)
+        self.btn.grid(column=2,row=6,sticky="e",**pad)
+
+    def start(self):
+        folder = self.inp.get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Error","Selecciona una carpeta válida."); return
+        if not fd.has_exiftool():
+            messagebox.showerror("Error","ExifTool no encontrado. Instálalo con: brew install exiftool"); return
+
+        # Conteo para barra
+        total = sum(1 for _ in fd.iter_files(folder, recursive=self.recursive.get()))
+        if total == 0:
+            messagebox.showinfo("Info","No se encontraron imágenes soportadas."); return
+
+        self.pb["value"]=0; self.pb["maximum"]=total
+        self.log.delete("1.0","end")
+        self.btn.state(["disabled"])
+        threading.Thread(target=self._run,args=(folder,total),daemon=True).start()
+
+    def _run(self, folder, total):
+        ok = fail = i = 0
+        recursive = self.recursive.get()
+        dry_run = self.dry_run.get()
+        try:
+            for path in fd.iter_files(folder, recursive=recursive):
+                success, msg = fd.set_file_times_from_best(path, dry_run=dry_run)
+                self.log.insert("end", msg + "\n"); self.log.see("end")
+                i += 1; self.pb["value"] = i
+                if success: ok += 1
+                else: fail += 1
+            self.log.insert("end", f"\nHecho. OK: {ok}, Fallos: {fail}\n")
+            if dry_run:
+                self.log.insert("end", "Dry-run activado: no se modificó ningún archivo.\n")
+        except Exception as e:
+            self.log.insert("end", f"\n❌ Error: {e}\n")
+            messagebox.showerror("Error", str(e))
+        finally:
+            self.btn.state(["!disabled"])
+
+# ====== Pantalla 5: Cambiar nombres ======
+class RenameFilesFrame(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+        self.folder = tk.StringVar()
+        self.recursive = tk.BooleanVar(value=False)  # default: current folder only
+        self.yyyymm = tk.StringVar()
+        self.tag = tk.StringVar()
+        self.camera = tk.StringVar()
+        self.film = tk.StringVar()
+        self.dry_run = tk.BooleanVar(value=True)     # safer default
+        self.pb = None; self.log = None; self.btn = None
+        self._build()
+
+    def _build(self):
+        pad={'padx':10,'pady':6}
+        ttk.Label(self, text="Rename — YYYYMM-Tag-Camera-Film-###", font=("TkDefaultFont", 12, "bold")).grid(column=0,row=0,columnspan=4,sticky="w",**pad)
+
+        # Folder
+        ttk.Label(self,text="Folder:").grid(column=0,row=1,sticky="w",**pad)
+        ttk.Entry(self,textvariable=self.folder,width=54).grid(column=1,row=1,sticky="we",**pad)
+        ttk.Button(self,text="Choose…",command=lambda: choose_dir(self.folder,"Folder to rename")).grid(column=2,row=1,**pad)
+        ttk.Checkbutton(self,text="Recursive",variable=self.recursive).grid(column=3,row=1,sticky="w",**pad)
+
+        ttk.Separator(self).grid(column=0,row=2,columnspan=4,sticky="we",**pad)
+
+        # Inputs
+        ttk.Label(self,text="YYYYMM:").grid(column=0,row=3,sticky="w",**pad)
+        ttk.Entry(self,textvariable=self.yyyymm,width=10).grid(column=1,row=3,sticky="w",**pad)
+
+        ttk.Label(self,text="Tag:").grid(column=0,row=4,sticky="w",**pad)
+        ttk.Entry(self,textvariable=self.tag,width=24).grid(column=1,row=4,sticky="w",**pad)
+
+        ttk.Label(self,text="Camera:").grid(column=0,row=5,sticky="w",**pad)
+        ttk.Entry(self,textvariable=self.camera,width=24).grid(column=1,row=5,sticky="w",**pad)
+
+        ttk.Label(self,text="Film:").grid(column=0,row=6,sticky="w",**pad)
+        ttk.Entry(self,textvariable=self.film,width=24).grid(column=1,row=6,sticky="w",**pad)
+
+        ttk.Checkbutton(self,text="Dry-run (preview only)",variable=self.dry_run).grid(column=0,row=7,sticky="w",**pad)
+
+        self.pb = ttk.Progressbar(self, mode="determinate")
+        self.pb.grid(column=0,row=8,columnspan=4,sticky="we",**pad)
+
+        self.log = tk.Text(self, height=12)
+        self.log.grid(column=0,row=9,columnspan=4,sticky="nsew",**pad)
+        self.grid_rowconfigure(9, weight=1); self.grid_columnconfigure(1, weight=1)
+
+        self.btn = ttk.Button(self,text="Rename",command=self.start)
+        self.btn.grid(column=3,row=10,sticky="e",**pad)
+
+    def start(self):
+        folder = self.folder.get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Error","Choose a valid folder."); return
+        try:
+            prefix = rn.build_prefix(self.yyyymm.get(), self.tag.get(), self.camera.get(), self.film.get())
+        except ValueError as e:
+            messagebox.showerror("Error", str(e)); return
+
+        files = rn.list_media(folder, recursive=self.recursive.get(), exts=rn.EXTS)
+        if not files:
+            messagebox.showinfo("Info","No supported media found."); return
+
+        plan = rn.plan_new_names(files, prefix)
+        self.pb["value"]=0; self.pb["maximum"]=len(plan)
+        self.log.delete("1.0","end")
+        self.btn.state(["disabled"])
+
+        # Run in thread
+        import threading
+        threading.Thread(target=self._run,args=(folder, plan),daemon=True).start()
+
+    def _run(self, folder, plan):
+        ok = skipped = i = 0
+        for src, dst in plan:
+            # apply one by one to keep progress smooth
+            _ok, _sk, msgs = rn.apply_plan(os.path.dirname(src), [(src, dst)], dry_run=self.dry_run.get())
+            ok += _ok; skipped += _sk
+            self.log.insert("end", msgs[0] + "\n")
+            self.log.see("end")
+            i += 1; self.pb["value"]=i
+
+        self.log.insert("end", f"\nDone. Renamed: {ok}, Skipped: {skipped}\n")
+        if self.dry_run.get():
+            self.log.insert("end", "Dry-run was ON — no files were changed.\n")
+        self.btn.state(["!disabled"])
+
+
 # ====== App principal (menú simple) ======
 class MainApp(tk.Tk):
     def __init__(self):
@@ -291,6 +453,8 @@ class MainApp(tk.Tk):
         tools.add_command(label="TIFF → JPEG", command=lambda: self.show("tiff"))
         tools.add_command(label="Split Half-Frames", command=lambda: self.show("split"))
         tools.add_command(label="Marcos 4:5 / 5:4", command=lambda: self.show("frames"))
+        tools.add_command(label="Fix Dates (EXIF → File)", command=lambda: self.show("fixdates"))
+        tools.add_command(label="Rename (YYYYMM-Tag-Camera-Film)", command=lambda: self.show("rename"))
         menubar.add_cascade(label="Herramientas", menu=tools)
         menubar.add_command(label="Salir", command=self.destroy)
 
@@ -300,6 +464,8 @@ class MainApp(tk.Tk):
             "tiff":   TiffToJpegFrame(self.container),
             "split":  SplitHalfFramesFrame(self.container),
             "frames": FramesPicFrame(self.container),
+            "fixdates": FixDatesFrame(self.container),
+            "rename": RenameFilesFrame(self.container),
         }
         for v in self.views.values():
             v.place(relx=0, rely=0, relwidth=1, relheight=1)
