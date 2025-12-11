@@ -1,12 +1,15 @@
+# split_half_frames.py
+
 import os
 import numpy as np
 from PIL import Image, ImageOps
 
-# Carpetas
+# Carpetas por defecto (las sobreescribe el GUI)
 INPUT_FOLDER = "scans"
 OUTPUT_FOLDER = "splits"
 
-# Parámetros de detección
+# ----------------- Parámetros de detección de bordes -----------------
+
 THRESHOLD_DARK = 25        # píxel considerado “muy oscuro”
 THRESHOLD_WHITE = 235      # píxel considerado “muy claro”
 BORDER_TOL = 0.92          # % de píxeles extremos para considerar “todo borde”
@@ -14,9 +17,13 @@ MAX_CROP_PCT = 0.12        # no recortar más del 12% por cada lado al auto-crop
 MARGIN = 0.20              # margen central ignorado para buscar el divisor
 WINDOW = 20                # refinado del divisor
 
-# Proporción nativa Pentax 17: 17x24 (lado corto / lado largo)
-TARGET_RATIO = 17.0 / 24.0
-RATIO_TOL = 0.10  # 10% de tolerancia antes de tocar nada
+# Pentax 17: fotograma 17×24 mm → siempre vertical, lado corto arriba
+PENTAX17_RATIO = 24.0 / 17.0  # alto / ancho ≈ 1.41
+
+
+# --------------------------------------------------------------------
+#   1) Auto-crop del marco blanco/negro del laboratorio (doble frame)
+# --------------------------------------------------------------------
 
 def autocrop_lab_border(img):
     """
@@ -85,6 +92,10 @@ def autocrop_lab_border(img):
     return img.crop((x0, y0, x1, y1))
 
 
+# --------------------------------------------------------------------
+#   2) Buscar la columna de separación entre las dos medias fotos
+# --------------------------------------------------------------------
+
 def find_split_column(arr, margin=MARGIN, window=WINDOW):
     """Busca la columna más oscura (divisor) en la zona central."""
     profile = arr.mean(axis=0)
@@ -100,94 +111,126 @@ def find_split_column(arr, margin=MARGIN, window=WINDOW):
     return l + np.argmin(profile[l:r])
 
 
+# --------------------------------------------------------------------
+#   3) Recorte fino de bandas negras respetando ratio Pentax 17
+# --------------------------------------------------------------------
+
+def _budget_from_ratio(h, w):
+    """
+    Calcula cuánto podemos recortar como máximo en alto y ancho para
+    seguir cumpliendo aproximadamente el ratio Pentax 17 (24/17).
+    """
+    # Queremos h_final >= w * ratio  →  recorte_total_h <= h - w*ratio
+    min_h = int(round(w * PENTAX17_RATIO))
+    max_crop_h = max(0, h - min_h)
+
+    # Y w_final >= h / ratio  →  recorte_total_w <= w - h/ratio
+    min_w = int(round(h / PENTAX17_RATIO))
+    max_crop_w = max(0, w - min_w)
+
+    return max_crop_h, max_crop_w
+
+
 def trim_dark_bands(img):
     """
-    Quita bandas oscuras finas remanentes en los cuatro lados
-    y usa la proporción 17x24 para evitar cortar demasiado imagen
-    en fotos muy oscuras.
+    Quita bandas oscuras finas remanentes en los cuatro lados,
+    pero SIN pasarse del ratio 24×17 de la Pentax 17.
+    Prefiere dejar algo de borde negro antes que comer imagen.
     """
     g = np.array(img.convert("L"))
     h, w = g.shape
 
-    # --- recorte inicial por bandas oscuras ---
+    # La Pentax 17 siempre es vertical; si por lo que sea viene apaisado, lo giramos.
+    if w > h:
+        img = img.rotate(90, expand=True)
+        g = np.array(img.convert("L"))
+        h, w = g.shape
+
+    max_crop_h, max_crop_w = _budget_from_ratio(h, w)
+
+    # --- recorte en vertical ---
     top = 0
-    while top < h and g[top, :].mean() < THRESHOLD_DARK:
-        top += 1
+    bottom = 0
 
-    bottom = h - 1
-    while bottom > 0 and g[bottom, :].mean() < THRESHOLD_DARK:
-        bottom -= 1
-
-    left = 0
-    while left < w and g[:, left].mean() < THRESHOLD_DARK:
-        left += 1
-
-    right = w - 1
-    while right > 0 and g[:, right].mean() < THRESHOLD_DARK:
-        right -= 1
-
-    # Aseguramos que hay algo de área
-    if bottom <= top:
-        top = 0
-        bottom = h - 1
-    if right <= left:
-        left = 0
-        right = w - 1
-
-    # --- cálculo de proporción resultante ---
-    crop_w = right - left + 1
-    crop_h = bottom - top + 1
-
-    short = min(crop_w, crop_h)
-    long = max(crop_w, crop_h)
-    ratio = short / float(long)
-
-    # Si la imagen se ha quedado "demasiado cuadrada"
-    # (ratio > TARGET_RATIO * (1 + tolerancia)),
-    # asumimos que hemos recortado demasiado en el lado largo
-    # y extendemos ese lado hacia el borde opuesto.
-    if ratio > TARGET_RATIO * (1.0 + RATIO_TOL):
-        # lado largo vertical
-        if crop_h >= crop_w:
-            # lado corto = ancho; lado largo = alto
-            desired_long = int(round(short / TARGET_RATIO))
-            desired_long = min(desired_long, h - top)  # no salirnos de la imagen
-            desired_bottom = top + desired_long - 1
-            bottom = min(h - 1, max(bottom, desired_bottom))
+    # desde arriba
+    while top < h and (top + bottom) < max_crop_h:
+        row = g[top, :]
+        if row.mean() < THRESHOLD_DARK:
+            top += 1
         else:
-            # lado largo horizontal
-            desired_long = int(round(short / TARGET_RATIO))
-            desired_long = min(desired_long, w - left)
-            desired_right = left + desired_long - 1
-            right = min(w - 1, max(right, desired_right))
+            break
 
-        # recomputamos dimensiones tras el ajuste
-        crop_w = right - left + 1
-        crop_h = bottom - top + 1
+    # desde abajo
+    while bottom < h - top and (top + bottom) < max_crop_h:
+        row = g[h - 1 - bottom, :]
+        if row.mean() < THRESHOLD_DARK:
+            bottom += 1
+        else:
+            break
 
-    # Coordenadas finales asegurando coherencia
-    x0 = max(0, min(left, right - 1))
-    x1 = min(w, max(right + 1, x0 + 1))
-    y0 = max(0, min(top, bottom - 1))
-    y1 = min(h, max(bottom + 1, y0 + 1))
+    # --- recorte en horizontal ---
+    left = 0
+    right = 0
 
-    return img.crop((x0, y0, x1, y1))
+    # desde la izquierda
+    while left < w and (left + right) < max_crop_w:
+        col = g[:, left]
+        if col.mean() < THRESHOLD_DARK:
+            left += 1
+        else:
+            break
 
+    # desde la derecha
+    while right < w - left and (left + right) < max_crop_w:
+        col = g[:, w - 1 - right]
+        if col.mean() < THRESHOLD_DARK:
+            right += 1
+        else:
+            break
+
+    x0 = max(0, min(left, w - right - 1))
+    x1 = min(w, max(w - right, x0 + 1))
+    y0 = max(0, min(top, h - bottom - 1))
+    y1 = min(h, max(h - bottom, y0 + 1))
+
+    cropped = img.crop((x0, y0, x1, y1))
+
+    # chequeo final: si el ratio ya está cerca, lo dejamos; si sigue MUY
+    # por encima (recorte tímido), recortamos un pelín del bottom para acercarlo
+    ch, cw = cropped.size[1], cropped.size[0]
+    ratio = ch / cw
+    if ratio > PENTAX17_RATIO * 1.10:  # más de un 10% más alto que el ratio teórico
+        target_h = int(round(cw * PENTAX17_RATIO))
+        if target_h < ch:
+            extra = ch - target_h
+            cropped = cropped.crop((0, extra, cw, ch))  # solo desde abajo
+
+    return cropped
+
+
+# --------------------------------------------------------------------
+#   4) Split completo + trim
+# --------------------------------------------------------------------
 
 def split_half_frame(img_path, output_folder):
-    # Carga con orientación correcta
+    """
+    Divide un escaneo doble en dos medias fotos, elimina marco de laboratorio
+    y ajusta bordes negros respetando el ratio Pentax 17.
+    """
     base = os.path.splitext(os.path.basename(img_path))[0]
+
+    # Carga con orientación correcta
     img = Image.open(img_path)
     img = ImageOps.exif_transpose(img).convert("RGB")
 
-    # 1) Quitar marco (blanco o negro) del laboratorio
+    # 1) Quitar marco blanco/negro grande
     img = autocrop_lab_border(img)
 
     # 2) Buscar divisor
     arr = np.array(img.convert("L"))
     split_col = find_split_column(arr)
 
-    # 3) Cortar y afinar bordes oscuros residuales
+    # 3) Cortar en dos y recortar bordes
     left_img  = img.crop((0, 0, split_col, img.height))
     right_img = img.crop((split_col, 0, img.width, img.height))
     left_img  = trim_dark_bands(left_img)
@@ -199,6 +242,34 @@ def split_half_frame(img_path, output_folder):
     right_img.save(os.path.join(output_folder, f"{base}_B.jpg"), quality=95, subsampling=0)
     print(f"✅ {base} → {base}_A.jpg + {base}_B.jpg")
 
+
+# --------------------------------------------------------------------
+#   5) Función de PREVIEW para el GUI
+# --------------------------------------------------------------------
+
+def preview_split(img_path):
+    """
+    Devuelve (img_entera_recortada, left, right) para usar en el GUI de preview.
+    NO escribe nada a disco.
+    """
+    img = Image.open(img_path)
+    img = ImageOps.exif_transpose(img).convert("RGB")
+
+    img2 = autocrop_lab_border(img)
+    arr = np.array(img2.convert("L"))
+    split_col = find_split_column(arr)
+
+    left_img  = img2.crop((0, 0, split_col, img2.height))
+    right_img = img2.crop((split_col, 0, img2.width, img2.height))
+    left_img  = trim_dark_bands(left_img)
+    right_img = trim_dark_bands(right_img)
+
+    return img2, left_img, right_img
+
+
+# --------------------------------------------------------------------
+#   6) Modo script directo
+# --------------------------------------------------------------------
 
 def main():
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
